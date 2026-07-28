@@ -6,7 +6,7 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import requests
 import xml.etree.ElementTree as ET
-import time
+import numpy as np
 
 # === Блок Google Trends с защитой ===
 try:
@@ -15,8 +15,8 @@ try:
 except ImportError:
     PYTREENDS_AVAILABLE = False
 
-st.set_page_config(layout="wide", page_title="Макро-Дашборд + EUR/RUB")
-st.title("📊 Макроэкономический дашборд: RUB, EUR, Нефть, DXY, Ставка ЦБ")
+st.set_page_config(layout="wide", page_title="Макро-Дашборд + Бэктест")
+st.title("📊 Макроэкономический дашборд + Автоматический бэктест")
 
 # === Боковая панель ===
 st.sidebar.header("Настройки")
@@ -28,20 +28,21 @@ slow = st.sidebar.slider("Медленная MA", 20, 200, 30, step=1)
 rsi_period = st.sidebar.slider("Период RSI", 7, 21, 14, step=1)
 rsi_overbought = st.sidebar.slider("RSI перекупленности (фильтр для BUY)", 60, 80, 70, step=1)
 
-# === Функция загрузки ключевой ставки ЦБ (через официальный XML) ===
+st.sidebar.subheader("Настройки бэктеста")
+backtest_asset = st.sidebar.selectbox("Актив для бэктеста", ["USD/RUB", "EUR/RUB", "Brent"])
+initial_capital = st.sidebar.number_input("Начальный капитал (руб.)", min_value=1000, value=10000, step=1000)
+commission = st.sidebar.slider("Комиссия на сделку (%)", 0.0, 1.0, 0.1, step=0.05) / 100
+
+# === Функция загрузки ключевой ставки ЦБ ===
 @st.cache_data(ttl=86400)
 def load_cbr_key_rate():
-    """Загружает историю ключевой ставки ЦБ РФ через XML-дамп с сайта ЦБ"""
     try:
-        # Используем официальную XML-выгрузку ЦБ
         url = "https://www.cbr.ru/Queries/KeyRate?date=2020-01-01"
         response = requests.get(url, timeout=10)
         response.encoding = 'utf-8'
         if response.status_code != 200:
             return None
-        # Парсим XML
         root = ET.fromstring(response.text)
-        # Ищем все элементы KeyRate
         rates = []
         for elem in root.findall(".//KeyRate"):
             date_str = elem.find('Date').text
@@ -56,8 +57,7 @@ def load_cbr_key_rate():
         df_rate.set_index('date', inplace=True)
         df_rate.sort_index(inplace=True)
         return df_rate
-    except Exception as e:
-        st.sidebar.warning(f"Ошибка загрузки ставки ЦБ: {e}")
+    except:
         return None
 
 # === Функция загрузки Google Trends ===
@@ -78,11 +78,10 @@ def load_google_trends(keyword, days):
             df = df.drop(columns=['isPartial'])
         df.columns = ['trend_index']
         return df
-    except Exception as e:
-        st.sidebar.warning(f"Ошибка загрузки Google Trends: {e}")
+    except:
         return None
 
-# === Основная функция загрузки рыночных данных ===
+# === Загрузка рыночных данных ===
 @st.cache_data(ttl=3600)
 def load_market_data(days):
     end = datetime.now()
@@ -110,7 +109,6 @@ def calculate_rsi(data, period=14):
     return rsi
 
 def generate_signals(price_series, fast, slow, rsi_period, rsi_overbought):
-    """Возвращает DataFrame с MA, RSI и сигналами (Filtered_Signal)"""
     df = pd.DataFrame(index=price_series.index)
     df['price'] = price_series
     df['MAf'] = df['price'].rolling(fast).mean()
@@ -124,13 +122,117 @@ def generate_signals(price_series, fast, slow, rsi_period, rsi_overbought):
     df.dropna(inplace=True)
     return df
 
+# === Функция бэктеста ===
+def run_backtest(price_series, signals_df, initial_capital=10000, commission=0.001):
+    """
+    signals_df должен содержать колонки 'price' и 'Filtered_Signal'
+    """
+    if signals_df.empty or len(signals_df) < 2:
+        return None
+    
+    capital = initial_capital
+    position = 0  # количество актива в штуках (для валюты - доллары/евро, для нефти - баррели)
+    entry_price = 0
+    trades = []
+    equity_curve = []
+
+    for i in range(len(signals_df)):
+        price = signals_df.iloc[i]['price']
+        signal = signals_df.iloc[i]['Filtered_Signal']
+        
+        # Если сигнал BUY и мы вне позиции
+        if signal == 1 and position == 0:
+            # покупаем на весь капитал
+            position = capital / price
+            entry_price = price
+            capital = 0  # все вложили
+            trades.append({'Дата входа': signals_df.index[i], 'Цена входа': price})
+        
+        # Если сигнал SELL и мы в позиции
+        elif signal == -1 and position > 0:
+            # продаём
+            exit_price = price
+            # выручка минус комиссия
+            gross = position * exit_price
+            fee = gross * commission
+            capital = gross - fee
+            # считаем доходность сделки
+            trade_return = (exit_price / entry_price - 1) * 100
+            trades[-1]['Дата выхода'] = signals_df.index[i]
+            trades[-1]['Цена выхода'] = exit_price
+            trades[-1]['Доходность %'] = trade_return
+            position = 0
+        
+        # Текущая стоимость портфеля (капитал + стоимость позиции)
+        if position > 0:
+            current_value = capital + position * price
+        else:
+            current_value = capital
+        equity_curve.append(current_value)
+    
+    # Если осталась открытая позиция, закрываем по последней цене
+    if position > 0 and trades:
+        last_price = signals_df.iloc[-1]['price']
+        gross = position * last_price
+        fee = gross * commission
+        capital = gross - fee
+        trade_return = (last_price / trades[-1]['Цена входа'] - 1) * 100
+        trades[-1]['Дата выхода'] = signals_df.index[-1]
+        trades[-1]['Цена выхода'] = last_price
+        trades[-1]['Доходность %'] = trade_return
+        position = 0
+        # обновляем последнюю точку equity
+        equity_curve[-1] = capital
+    
+    # Итоговый капитал
+    final_capital = capital if position == 0 else capital + position * signals_df.iloc[-1]['price']
+    total_return = (final_capital / initial_capital - 1) * 100
+    
+    # Детали сделок
+    trades_df = pd.DataFrame(trades)
+    if not trades_df.empty:
+        win_trades = (trades_df['Доходность %'] > 0).sum()
+        loss_trades = (trades_df['Доходность %'] < 0).sum()
+        win_rate = win_trades / len(trades_df) * 100 if len(trades_df) > 0 else 0
+        avg_return = trades_df['Доходность %'].mean()
+        max_return = trades_df['Доходность %'].max()
+        min_return = trades_df['Доходность %'].min()
+    else:
+        win_rate = avg_return = max_return = min_return = 0
+    
+    # Максимальная просадка equity
+    equity_series = pd.Series(equity_curve, index=signals_df.index)
+    running_max = equity_series.expanding().max()
+    drawdown = (equity_series - running_max) / running_max * 100
+    max_drawdown = drawdown.min()
+    
+    # Коэффициент Шарпа (годовой, безрисковая ставка = 0) - упрощённо
+    returns = equity_series.pct_change().dropna()
+    if len(returns) > 1:
+        sharpe = returns.mean() / returns.std() * np.sqrt(252) if returns.std() != 0 else 0
+    else:
+        sharpe = 0
+    
+    return {
+        'total_return': total_return,
+        'final_capital': final_capital,
+        'num_trades': len(trades_df),
+        'win_rate': win_rate,
+        'avg_return': avg_return,
+        'max_return': max_return,
+        'min_return': min_return,
+        'max_drawdown': max_drawdown,
+        'sharpe_ratio': sharpe,
+        'trades_df': trades_df,
+        'equity_curve': equity_series
+    }
+
 # === Загрузка данных ===
 df = load_market_data(days)
 if df is None:
     st.error("Не удалось загрузить рыночные данные. Проверьте интернет.")
     st.stop()
 
-# Загружаем ключевую ставку и Google Trends
 df_rate = load_cbr_key_rate()
 df_trends = load_google_trends("курс доллара", min(days, 180))
 
@@ -145,13 +247,11 @@ df['DXY_RSI'] = calculate_rsi(df['DXY'], rsi_period)
 last = df.iloc[-1]
 prev = df.iloc[-2] if len(df) > 1 else last
 
-# Метрики
 col1, col2, col3, col4, col5, col6 = st.columns(6)
 col1.metric("USD/RUB", f"{last['USD_RUB']:.4f}", f"{(last['USD_RUB']/prev['USD_RUB']-1)*100:.2f}%")
 col2.metric("EUR/RUB", f"{last['EUR_RUB']:.4f}", f"{(last['EUR_RUB']/prev['EUR_RUB']-1)*100:.2f}%")
 col3.metric("Нефть Brent", f"{last['Brent']:.2f}", f"{(last['Brent']/prev['Brent']-1)*100:.2f}%")
 col4.metric("Индекс DXY", f"{last['DXY']:.2f}", f"{(last['DXY']/prev['DXY']-1)*100:.2f}%")
-
 if df_rate is not None and not df_rate.empty:
     col5.metric("Ключевая ставка ЦБ", f"{df_rate.iloc[-1]['key_rate']:.2f}%")
 else:
@@ -212,12 +312,11 @@ fig.update_yaxes(title_text="Нефть", row=3, col=1)
 fig.add_trace(go.Scatter(x=df.index, y=df['DXY'], mode='lines', name='DXY', line=dict(color='green')), row=4, col=1)
 fig.update_yaxes(title_text="DXY", row=4, col=1)
 
-# Ряд 5: Ключевая ставка ЦБ
+# Ряд 5: Ключевая ставка
 if df_rate is not None and not df_rate.empty:
     fig.add_trace(go.Scatter(x=df_rate.index, y=df_rate['key_rate'], mode='lines+markers', name='Ключевая ставка', line=dict(color='red', width=2)), row=5, col=1)
     fig.update_yaxes(title_text="Ставка %", row=5, col=1)
 else:
-    # Если данных нет, выведем пустое место с сообщением
     fig.add_trace(go.Scatter(x=[], y=[], mode='lines', name='Нет данных'), row=5, col=1)
     fig.update_yaxes(title_text="Ставка % (недоступна)", row=5, col=1)
 
@@ -231,7 +330,58 @@ st.subheader("🔍 Google Trends: 'курс доллара' в России")
 if df_trends is not None and not df_trends.empty:
     st.line_chart(df_trends)
 else:
-    st.info("Данные Google Trends временно недоступны. Это может быть связано с ограничениями сервиса или сетевых запросов из облачной среды. Остальные данные актуальны.")
+    st.info("Данные Google Trends временно недоступны.")
+
+# === БЭКТЕСТ ===
+st.subheader("📈 Автоматический бэктест стратегии")
+
+# Выбор данных для бэктеста
+if backtest_asset == "USD/RUB":
+    price_series = df['USD_RUB']
+    signals = signals_usd
+elif backtest_asset == "EUR/RUB":
+    price_series = df['EUR_RUB']
+    signals = signals_eur
+else:  # Brent
+    price_series = df['Brent']
+    signals = signals_brent
+
+# Запуск бэктеста
+if not signals.empty and len(signals) > 1:
+    backtest_result = run_backtest(price_series, signals, initial_capital, commission)
+    if backtest_result:
+        # Метрики в колонках
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
+        col1.metric("Общая доходность", f"{backtest_result['total_return']:.2f}%")
+        col2.metric("Конечный капитал", f"{backtest_result['final_capital']:.2f} ₽")
+        col3.metric("Количество сделок", backtest_result['num_trades'])
+        col4.metric("Процент прибыльных", f"{backtest_result['win_rate']:.1f}%")
+        col5.metric("Макс. просадка", f"{backtest_result['max_drawdown']:.2f}%")
+        col6.metric("Коэф. Шарпа", f"{backtest_result['sharpe_ratio']:.2f}")
+
+        # Доп. метрики (средняя доходность сделки)
+        st.write(f"**Средняя доходность на сделку:** {backtest_result['avg_return']:.2f}%  |  Лучшая: {backtest_result['max_return']:.2f}%  |  Худшая: {backtest_result['min_return']:.2f}%")
+
+        # График equity
+        st.subheader("📊 Кривая капитала (Equity Curve)")
+        equity_df = pd.DataFrame({
+            'Дата': backtest_result['equity_curve'].index,
+            'Капитал': backtest_result['equity_curve'].values
+        })
+        st.line_chart(equity_df.set_index('Дата'))
+
+        # Таблица сделок
+        if not backtest_result['trades_df'].empty:
+            with st.expander("📋 Детали сделок"):
+                st.dataframe(backtest_result['trades_df'].style.format({
+                    'Цена входа': '{:.4f}',
+                    'Цена выхода': '{:.4f}',
+                    'Доходность %': '{:.2f}'
+                }))
+    else:
+        st.warning("Недостаточно данных для бэктеста (нужно минимум 2 сигнала).")
+else:
+    st.warning("Сигналов не обнаружено. Измените параметры стратегии, чтобы получить сигналы.")
 
 # === Корреляции ===
 st.subheader("📈 Корреляция между активами")
@@ -244,4 +394,4 @@ for i, (label, period) in enumerate(periods.items()):
         cols[i].write(f"**{label}**")
         cols[i].dataframe(corr.style.background_gradient(cmap='RdYlGn', vmin=-1, vmax=1))
 
-st.caption("Данные: Yahoo Finance, ЦБ РФ (XML), Google Trends. Сигналы не являются инвестиционной рекомендацией.")
+st.caption("Данные: Yahoo Finance, ЦБ РФ (XML), Google Trends. Сигналы и бэктест не являются инвестиционной рекомендацией.")
