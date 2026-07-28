@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import requests
 import xml.etree.ElementTree as ET
 import numpy as np
+from itertools import product
 
 # === Блок Google Trends с защитой ===
 try:
@@ -15,8 +16,8 @@ try:
 except ImportError:
     PYTREENDS_AVAILABLE = False
 
-st.set_page_config(layout="wide", page_title="Макро-Дашборд + Бэктест")
-st.title("📊 Макроэкономический дашборд + Автоматический бэктест")
+st.set_page_config(layout="wide", page_title="Макро-Дашборд + Бэктест + Оптимизация")
+st.title("📊 Макроэкономический дашборд + Автоматический бэктест и оптимизация")
 
 # === Боковая панель ===
 st.sidebar.header("Настройки")
@@ -32,6 +33,18 @@ st.sidebar.subheader("Настройки бэктеста")
 backtest_asset = st.sidebar.selectbox("Актив для бэктеста", ["USD/RUB", "EUR/RUB", "Brent"])
 initial_capital = st.sidebar.number_input("Начальный капитал (руб.)", min_value=1000, value=10000, step=1000)
 commission = st.sidebar.slider("Комиссия на сделку (%)", 0.0, 1.0, 0.1, step=0.05) / 100
+
+# === Секция оптимизации ===
+st.sidebar.subheader("Оптимизация параметров")
+optimize_enabled = st.sidebar.checkbox("Включить оптимизацию", value=False)
+if optimize_enabled:
+    st.sidebar.write("Диапазоны для перебора:")
+    fast_range = st.sidebar.slider("Быстрая MA (мин, макс, шаг)", 5, 50, (5, 20, 5), step=1)
+    slow_range = st.sidebar.slider("Медленная MA (мин, макс, шаг)", 20, 200, (20, 60, 10), step=1)
+    rsi_period_range = st.sidebar.slider("Период RSI (мин, макс, шаг)", 7, 21, (7, 14, 7), step=1)
+    rsi_ob_range = st.sidebar.slider("RSI перекупленности (мин, макс, шаг)", 60, 80, (65, 75, 5), step=1)
+    optimize_metric = st.sidebar.selectbox("Критерий оптимизации", ["Доходность %", "Коэффициент Шарпа"])
+    optimize_button = st.sidebar.button("Запустить оптимизацию")
 
 # === Функция загрузки ключевой ставки ЦБ ===
 @st.cache_data(ttl=86400)
@@ -122,16 +135,16 @@ def generate_signals(price_series, fast, slow, rsi_period, rsi_overbought):
     df.dropna(inplace=True)
     return df
 
-# === Функция бэктеста ===
-def run_backtest(price_series, signals_df, initial_capital=10000, commission=0.001):
+# === Функция бэктеста с учётом депозита и Шарпа ===
+def run_backtest(price_series, signals_df, initial_capital=10000, commission=0.001, risk_free_rate=None):
     """
-    signals_df должен содержать колонки 'price' и 'Filtered_Signal'
+    risk_free_rate - средняя ключевая ставка за период (в долях, годовая), если None, не учитываем
     """
     if signals_df.empty or len(signals_df) < 2:
         return None
     
     capital = initial_capital
-    position = 0  # количество актива в штуках (для валюты - доллары/евро, для нефти - баррели)
+    position = 0
     entry_price = 0
     trades = []
     equity_curve = []
@@ -140,37 +153,29 @@ def run_backtest(price_series, signals_df, initial_capital=10000, commission=0.0
         price = signals_df.iloc[i]['price']
         signal = signals_df.iloc[i]['Filtered_Signal']
         
-        # Если сигнал BUY и мы вне позиции
         if signal == 1 and position == 0:
-            # покупаем на весь капитал
             position = capital / price
             entry_price = price
-            capital = 0  # все вложили
+            capital = 0
             trades.append({'Дата входа': signals_df.index[i], 'Цена входа': price})
         
-        # Если сигнал SELL и мы в позиции
         elif signal == -1 and position > 0:
-            # продаём
             exit_price = price
-            # выручка минус комиссия
             gross = position * exit_price
             fee = gross * commission
             capital = gross - fee
-            # считаем доходность сделки
             trade_return = (exit_price / entry_price - 1) * 100
             trades[-1]['Дата выхода'] = signals_df.index[i]
             trades[-1]['Цена выхода'] = exit_price
             trades[-1]['Доходность %'] = trade_return
             position = 0
         
-        # Текущая стоимость портфеля (капитал + стоимость позиции)
         if position > 0:
             current_value = capital + position * price
         else:
             current_value = capital
         equity_curve.append(current_value)
     
-    # Если осталась открытая позиция, закрываем по последней цене
     if position > 0 and trades:
         last_price = signals_df.iloc[-1]['price']
         gross = position * last_price
@@ -181,15 +186,12 @@ def run_backtest(price_series, signals_df, initial_capital=10000, commission=0.0
         trades[-1]['Цена выхода'] = last_price
         trades[-1]['Доходность %'] = trade_return
         position = 0
-        # обновляем последнюю точку equity
         equity_curve[-1] = capital
     
-    # Итоговый капитал
     final_capital = capital if position == 0 else capital + position * signals_df.iloc[-1]['price']
     total_return = (final_capital / initial_capital - 1) * 100
     
-    # Детали сделок
-    trades_df = pd.DataFrame(trades)
+    trades_df = pd.DataFrame(trades) if trades else pd.DataFrame()
     if not trades_df.empty:
         win_trades = (trades_df['Доходность %'] > 0).sum()
         loss_trades = (trades_df['Доходность %'] < 0).sum()
@@ -200,16 +202,34 @@ def run_backtest(price_series, signals_df, initial_capital=10000, commission=0.0
     else:
         win_rate = avg_return = max_return = min_return = 0
     
-    # Максимальная просадка equity
     equity_series = pd.Series(equity_curve, index=signals_df.index)
     running_max = equity_series.expanding().max()
     drawdown = (equity_series - running_max) / running_max * 100
     max_drawdown = drawdown.min()
     
-    # Коэффициент Шарпа (годовой, безрисковая ставка = 0) - упрощённо
+    # Доходность депозита (если ставка известна)
+    deposit_return = None
+    deposit_equity = None
+    if risk_free_rate is not None:
+        # Считаем, что ставка годовая, капитал растёт линейно (простые проценты)
+        days_in_period = (signals_df.index[-1] - signals_df.index[0]).days
+        deposit_return = risk_free_rate * (days_in_period / 365) * 100  # в процентах
+        # Кривая капитала депозита (линейный рост от initial до final)
+        deposit_equity = initial_capital * (1 + risk_free_rate * (np.arange(len(equity_series)) / 365))
+        deposit_equity = pd.Series(deposit_equity, index=signals_df.index)
+    
+    # Коэффициент Шарпа (годовой, с учётом безрисковой ставки)
     returns = equity_series.pct_change().dropna()
-    if len(returns) > 1:
-        sharpe = returns.mean() / returns.std() * np.sqrt(252) if returns.std() != 0 else 0
+    if len(returns) > 1 and risk_free_rate is not None:
+        # Средняя дневная доходность стратегии
+        mean_daily_return = returns.mean()
+        std_daily_return = returns.std()
+        # Безрисковая дневная ставка (годовая / 252)
+        rf_daily = risk_free_rate / 252
+        if std_daily_return != 0:
+            sharpe = (mean_daily_return - rf_daily) / std_daily_return * np.sqrt(252)
+        else:
+            sharpe = 0
     else:
         sharpe = 0
     
@@ -224,8 +244,42 @@ def run_backtest(price_series, signals_df, initial_capital=10000, commission=0.0
         'max_drawdown': max_drawdown,
         'sharpe_ratio': sharpe,
         'trades_df': trades_df,
-        'equity_curve': equity_series
+        'equity_curve': equity_series,
+        'deposit_return': deposit_return,
+        'deposit_equity': deposit_equity
     }
+
+# === Функция оптимизации параметров ===
+def optimize_parameters(price_series, fast_range, slow_range, rsi_period_range, rsi_ob_range, initial_capital, commission, risk_free_rate, metric='return'):
+    best_result = None
+    best_params = None
+    best_value = -np.inf if metric == 'return' else -np.inf
+    total_combinations = 0
+    for fast, slow, rsi_p, rsi_ob in product(
+        range(fast_range[0], fast_range[1]+1, fast_range[2]),
+        range(slow_range[0], slow_range[1]+1, slow_range[2]),
+        range(rsi_period_range[0], rsi_period_range[1]+1, rsi_period_range[2]),
+        range(rsi_ob_range[0], rsi_ob_range[1]+1, rsi_ob_range[2])
+    ):
+        if fast >= slow:
+            continue
+        total_combinations += 1
+        signals = generate_signals(price_series, fast, slow, rsi_p, rsi_ob)
+        if signals.empty or len(signals) < 2:
+            continue
+        result = run_backtest(price_series, signals, initial_capital, commission, risk_free_rate)
+        if result is None:
+            continue
+        # Критерий
+        if metric == 'Доходность %':
+            value = result['total_return']
+        else:  # Шарп
+            value = result['sharpe_ratio']
+        if value > best_value:
+            best_value = value
+            best_result = result
+            best_params = (fast, slow, rsi_p, rsi_ob)
+    return best_params, best_result, total_combinations
 
 # === Загрузка данных ===
 df = load_market_data(days)
@@ -235,6 +289,9 @@ if df is None:
 
 df_rate = load_cbr_key_rate()
 df_trends = load_google_trends("курс доллара", min(days, 180))
+
+# Текущая ключевая ставка для безрисковой ставки
+current_rate = df_rate.iloc[-1]['key_rate'] / 100 if df_rate is not None else 0.21  # запасное значение
 
 # === Генерация сигналов ===
 signals_usd = generate_signals(df['USD_RUB'], fast, slow, rsi_period, rsi_overbought)
@@ -348,7 +405,8 @@ else:  # Brent
 
 # Запуск бэктеста
 if not signals.empty and len(signals) > 1:
-    backtest_result = run_backtest(price_series, signals, initial_capital, commission)
+    risk_free_rate = current_rate  # текущая ставка ЦБ как безрисковая
+    backtest_result = run_backtest(price_series, signals, initial_capital, commission, risk_free_rate)
     if backtest_result:
         # Метрики в колонках
         col1, col2, col3, col4, col5, col6 = st.columns(6)
@@ -357,18 +415,25 @@ if not signals.empty and len(signals) > 1:
         col3.metric("Количество сделок", backtest_result['num_trades'])
         col4.metric("Процент прибыльных", f"{backtest_result['win_rate']:.1f}%")
         col5.metric("Макс. просадка", f"{backtest_result['max_drawdown']:.2f}%")
-        col6.metric("Коэф. Шарпа", f"{backtest_result['sharpe_ratio']:.2f}")
+        col6.metric("Коэф. Шарпа (с учётом ставки)", f"{backtest_result['sharpe_ratio']:.2f}")
 
-        # Доп. метрики (средняя доходность сделки)
         st.write(f"**Средняя доходность на сделку:** {backtest_result['avg_return']:.2f}%  |  Лучшая: {backtest_result['max_return']:.2f}%  |  Худшая: {backtest_result['min_return']:.2f}%")
 
-        # График equity
-        st.subheader("📊 Кривая капитала (Equity Curve)")
-        equity_df = pd.DataFrame({
-            'Дата': backtest_result['equity_curve'].index,
-            'Капитал': backtest_result['equity_curve'].values
-        })
-        st.line_chart(equity_df.set_index('Дата'))
+        # Сравнение с депозитом
+        if backtest_result['deposit_return'] is not None:
+            deposit_return = backtest_result['deposit_return']
+            st.write(f"**Доходность депозита (под {risk_free_rate*100:.2f}% годовых):** {deposit_return:.2f}%")
+            diff = backtest_result['total_return'] - deposit_return
+            st.write(f"**Превышение стратегии над депозитом:** {diff:.2f}%")
+
+        # График equity с депозитом
+        st.subheader("📊 Кривая капитала vs депозит")
+        fig_equity = go.Figure()
+        fig_equity.add_trace(go.Scatter(x=backtest_result['equity_curve'].index, y=backtest_result['equity_curve'], mode='lines', name='Стратегия', line=dict(color='cyan')))
+        if backtest_result['deposit_equity'] is not None:
+            fig_equity.add_trace(go.Scatter(x=backtest_result['deposit_equity'].index, y=backtest_result['deposit_equity'], mode='lines', name='Депозит', line=dict(color='orange', dash='dot')))
+        fig_equity.update_layout(template='plotly_dark', height=400, hovermode='x unified')
+        st.plotly_chart(fig_equity, use_container_width=True)
 
         # Таблица сделок
         if not backtest_result['trades_df'].empty:
@@ -383,6 +448,43 @@ if not signals.empty and len(signals) > 1:
 else:
     st.warning("Сигналов не обнаружено. Измените параметры стратегии, чтобы получить сигналы.")
 
+# === ОПТИМИЗАЦИЯ ===
+if optimize_enabled and 'optimize_button' in locals() and optimize_button:
+    with st.spinner("Идёт перебор параметров... Это может занять до 1 минуты."):
+        # Определяем диапазоны из слайдеров
+        fast_min, fast_max, fast_step = fast_range
+        slow_min, slow_max, slow_step = slow_range
+        rsi_p_min, rsi_p_max, rsi_p_step = rsi_period_range
+        rsi_ob_min, rsi_ob_max, rsi_ob_step = rsi_ob_range
+        best_params, best_result, total_combos = optimize_parameters(
+            price_series,
+            (fast_min, fast_max, fast_step),
+            (slow_min, slow_max, slow_step),
+            (rsi_p_min, rsi_p_max, rsi_p_step),
+            (rsi_ob_min, rsi_ob_max, rsi_ob_step),
+            initial_capital,
+            commission,
+            current_rate,
+            metric=optimize_metric
+        )
+        if best_params is not None and best_result is not None:
+            st.success(f"Оптимизация завершена! Перебрано {total_combos} комбинаций.")
+            st.write(f"**Лучшие параметры:** Быстрая MA = {best_params[0]}, Медленная MA = {best_params[1]}, Период RSI = {best_params[2]}, RSI перекупленности = {best_params[3]}")
+            st.write(f"**Значение критерия ({optimize_metric}):** {best_result['total_return'] if optimize_metric == 'Доходность %' else best_result['sharpe_ratio']:.2f}")
+            st.write(f"**Общая доходность:** {best_result['total_return']:.2f}%")
+            st.write(f"**Коэф. Шарпа:** {best_result['sharpe_ratio']:.2f}")
+            st.write(f"**Количество сделок:** {best_result['num_trades']}")
+            st.write(f"**Макс. просадка:** {best_result['max_drawdown']:.2f}%")
+            # Показать график equity для лучших параметров
+            fig_opt = go.Figure()
+            fig_opt.add_trace(go.Scatter(x=best_result['equity_curve'].index, y=best_result['equity_curve'], mode='lines', name='Оптимальная стратегия', line=dict(color='lime')))
+            if best_result['deposit_equity'] is not None:
+                fig_opt.add_trace(go.Scatter(x=best_result['deposit_equity'].index, y=best_result['deposit_equity'], mode='lines', name='Депозит', line=dict(color='orange', dash='dot')))
+            fig_opt.update_layout(template='plotly_dark', height=400, title='Кривая капитала для оптимальных параметров', hovermode='x unified')
+            st.plotly_chart(fig_opt, use_container_width=True)
+        else:
+            st.warning("Не найдено подходящих комбинаций. Попробуйте расширить диапазоны.")
+
 # === Корреляции ===
 st.subheader("📈 Корреляция между активами")
 periods = {'30 дней': 30, '90 дней': 90}
@@ -394,4 +496,4 @@ for i, (label, period) in enumerate(periods.items()):
         cols[i].write(f"**{label}**")
         cols[i].dataframe(corr.style.background_gradient(cmap='RdYlGn', vmin=-1, vmax=1))
 
-st.caption("Данные: Yahoo Finance, ЦБ РФ (XML), Google Trends. Сигналы и бэктест не являются инвестиционной рекомендацией.")
+st.caption("Данные: Yahoo Finance, ЦБ РФ (XML), Google Trends. Сигналы, бэктест и оптимизация не являются инвестиционной рекомендацией.")
